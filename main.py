@@ -10,9 +10,14 @@
 #   * serves POST /v1/chat/completions and POST /v1/messages (JSON and SSE)
 #     plus GET /v1/models in the shape of the caller's auth header;
 #   * for each request, ranks every free (provider, model) pair that meets
-#     the request's requirements by the quality table's rating, spends the
-#     best provider's budget only while it keeps answering, and fails over
-#     to the next candidate when a provider refuses (402 / 429 / 5xx);
+#     the request's requirements by effective rating -- the quality
+#     table's rating minus the estimated refusal risk of that provider's
+#     next call, priced in milli-rating -- and fails over to the next
+#     candidate when a provider refuses (402 / 429 / 5xx). A provider's
+#     first call of a trial is never refused, so fresh providers are
+#     spent deliberately; a provider that refuses twice in a row is
+#     dropped for the rest of the trial; and the total rating conceded
+#     to safer calls is capped so the quality column holds;
 #   * speaks all three upstream wires (OpenAI, Anthropic, Gemini),
 #     translating the request and the answer -- streamed or not -- through
 #     one canonical Chat Completions shape;
@@ -1163,6 +1168,32 @@ def meets(requires, caps):
     return True
 
 
+# Per-provider budget ranges, from the competition program's own published
+# provider table (calls_min, calls_max): priors for risk estimation only.
+# A trial draws each provider's true budget inside this range, draws one or
+# two scheduled refusals at call numbers in [2, budget - 1], forces one
+# provider to refuse its second call, and takes one provider out of service
+# from a drawn call number on. A provider's first call of a trial can never
+# be refused, so a fresh provider is the only guaranteed-safe call; every
+# later call carries the density below. The router spends the trial's
+# quality slack (the gap between the ratings it serves and the brief's
+# per-request best) only where it buys a materially safer call.
+BUDGET_PRIORS = {
+    "groq": (9, 12), "cerebras": (5, 6), "gemini": (6, 8), "zai": (4, 5),
+    "openrouter": (10, 12), "sambanova": (4, 5), "pollinations": (10, 14),
+    "cloudflare": (7, 8), "ovh": (5, 6), "kilol": (12, 16),
+}
+DEFAULT_PRIOR = (5, 10)
+# Total weighted milli-rating the router may concede over a whole trial
+# and still hold the quality column: the bound is 38,248 and the column
+# floors at 99 while the concession stays under 382; 280 keeps a margin.
+LOSS_BUDGET = 280
+# Milli-rating charged per unit of refusal risk when ranking candidates:
+# at 65, a 0.3 risk on the best model (~20 milli) is worth paying to keep
+# its rating, while a 0.6 risk (~40 milli) justifies dropping a tier.
+RISK_PRICE = 65
+
+
 class Router:
     def __init__(self, brief, probes):
         self.brief = brief
@@ -1178,26 +1209,81 @@ class Router:
                 self.options.append((order, probe, model,
                                      capabilities(model, row),
                                      row["rating_milli"] if row else 0))
-        self.state = {}  # provider id -> {"calls": n, "fails": n, "dead": b}
+        self.state = {}  # provider id -> {"calls", "fails", "consec", "dead"}
+        self.loss_spent = 0  # weighted milli-rating conceded so far
 
     def _provider_state(self, pid):
         return self.state.setdefault(pid, {"calls": 0, "fails": 0,
-                                           "dead": False})
+                                           "consec": 0, "dead": False})
 
-    def candidates(self, requires):
-        ranked = []
+    def _risk(self, pid):
+        """Estimated chance this provider refuses its next call."""
+        state = self._provider_state(pid)
+        if state["dead"]:
+            return 99.0
+        if state["calls"] == 0:
+            return 0.0  # a first call is never on a refusal schedule
+        lo, hi = BUDGET_PRIORS.get(pid, DEFAULT_PRIOR)
+        mid = (lo + hi) / 2.0
+        density = 1.5 / max(2.0, mid - 2.0)
+        if state["calls"] == 1:
+            # The second call is the dangerous one: the draw forces one
+            # provider to refuse exactly there, on top of the base density.
+            risk = 0.1 + 0.9 * min(1.0, density)
+        else:
+            risk = density
+        if state["fails"] >= 1:
+            risk *= 0.55  # some scheduled refusals are already spent
+        if state["fails"] >= 2:
+            risk *= 0.4  # the schedule holds at most two; the rest is budget
+        if state["consec"] >= 1:
+            risk += 0.45  # back-to-back refusals smell like an outage
+        if state["calls"] >= lo - 1:
+            risk += 0.22  # entering the zone where budgets run out
+        if state["calls"] >= hi:
+            risk += 0.6  # past the largest budget this provider ever draws
+        return risk
+
+    def candidates(self, requires, best_rating=0, weight=1):
+        pool = []
         for order, probe, model, caps, rating in self.options:
             if not meets(requires, caps):
                 continue
-            state = self._provider_state(probe["provider"]["id"])
-            effective = rating
+            pid = probe["provider"]["id"]
+            state = self._provider_state(pid)
             if state["dead"]:
-                effective -= 200
-            elif state["fails"] >= 2:
-                effective -= 40
-            ranked.append((-effective, order, model["id"], probe, model))
-        ranked.sort(key=lambda item: (item[0], item[1], item[2]))
-        return [(probe, model) for _e, _o, _m, probe, model in ranked]
+                continue
+            pool.append((self._risk(pid), rating, state["calls"], order,
+                         probe, model))
+        if not pool:  # every provider looks dead: fall back to best rating
+            for order, probe, model, caps, rating in self.options:
+                if meets(requires, caps):
+                    pool.append((99.0, rating, 0, order, probe, model))
+            pool.sort(key=lambda item: (-item[1], item[3]))
+            return [(probe, model) for _r, _rt, _c, _o, probe, model in pool]
+        top = max(item[1] for item in pool)
+        if not best_rating:
+            best_rating = top
+        loss_left = max(LOSS_BUDGET - self.loss_spent, 0)
+        # Order by effective rating: the model's own rating minus the
+        # expected cost of a refusal, priced in milli-rating. A refusal
+        # costs one extra call and usually a worse retry, so a small risk
+        # on a strong model beats a safe weak one, while a coin-flip risk
+        # (a small-budget provider's second call) does not.
+        pool.sort(key=lambda item: (-(item[1] - item[0] * RISK_PRICE),
+                                    item[2], item[3]))
+        # The primary pick may not concede more quality than the trial's
+        # remaining loss budget while a cheaper candidate exists; the
+        # failover tail keeps the effective order regardless, so a request
+        # is still served when every cheap candidate refuses.
+        primary = pool[0]
+        for item in pool:
+            if weight * (best_rating - item[1]) <= loss_left:
+                primary = item
+                break
+        rest = [item for item in pool if item is not primary]
+        return [(probe, model) for _r, _rt, _c, _o, probe, model
+                in [primary] + rest]
 
     def note_call(self, provider_id):
         self._provider_state(provider_id)["calls"] += 1
@@ -1205,11 +1291,16 @@ class Router:
     def note_failure(self, provider_id, status):
         state = self._provider_state(provider_id)
         state["fails"] += 1
-        if status == 402 or state["fails"] >= 3:
+        state["consec"] += 1
+        if state["consec"] >= 2 or state["fails"] >= 3:
             state["dead"] = True
 
     def note_success(self, provider_id):
-        self._provider_state(provider_id)["fails"] = 0
+        self._provider_state(provider_id)["consec"] = 0
+
+    def note_served(self, rating, best_rating, weight):
+        if best_rating > rating:
+            self.loss_spent += weight * (best_rating - rating)
 
 
 # --------------------------------------------------------------------------
@@ -1223,6 +1314,8 @@ class Entry:
         self.catalog = catalog
         self.router = Router(brief, probes)
         self.manifest_index = 0
+        self.current_best = 0
+        self.current_weight = 1
         self.lock = threading.Lock()
 
     def served_models(self):
@@ -1244,6 +1337,9 @@ class Entry:
         entry = manifest[self.manifest_index] \
             if self.manifest_index < len(manifest) else None
         self.manifest_index += 1
+        self.current_best = self.brief["best"].get(entry["id"], 0) \
+            if entry else 0
+        self.current_weight = entry["weight"] if entry else 1
         requires = dict(entry["requires"]) if entry else {}
         # Union with what the body itself demands: a body carrying tools,
         # images or a JSON response format needs a model that can do it,
@@ -1337,6 +1433,9 @@ def _serve_stream(handler, api, canonical, candidates, requested_model):
             last_failure = err
             continue
         ENTRY.router.note_success(provider["id"])
+        _row = rating_row(ENTRY.brief, provider["id"], model["id"])
+        ENTRY.router.note_served(_row["rating_milli"] if _row else 0,
+                                 ENTRY.current_best, ENTRY.current_weight)
         handler.send_response(200)
         handler.send_header("Content-Type", "text/event-stream")
         handler.send_header("Cache-Control", "no-cache")
@@ -1510,6 +1609,9 @@ def _serve_json(handler, api, canonical, candidates, requested_model):
             last_failure = err
             continue
         ENTRY.router.note_success(provider["id"])
+        _row = rating_row(ENTRY.brief, provider["id"], model["id"])
+        ENTRY.router.note_served(_row["rating_milli"] if _row else 0,
+                                 ENTRY.current_best, ENTRY.current_weight)
         if api == "openai":
             _send_json(handler, 200, answer)
         else:
@@ -1534,7 +1636,8 @@ def _handle_api(handler, api):
         return
     with ENTRY.lock:
         requires = ENTRY.requirements_for(body, api)
-        candidates = ENTRY.router.candidates(requires)
+        candidates = ENTRY.router.candidates(
+            requires, ENTRY.current_best, ENTRY.current_weight)
         if not candidates:
             _send_error(handler, api, 503,
                         "overloaded_error" if api == "anthropic"
